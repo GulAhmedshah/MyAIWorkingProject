@@ -1,0 +1,21 @@
+{
+  "name": "nft-staking-platform",
+  "version": "1.0.0",
+  "description": "An NFT staking platform built with Hardhat and OpenZeppelin.",
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "coverage": "hardhat coverage",
+    "node": "hardhat node"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^5.0.0",
+    "@openzeppelin/hardhat-upgrades": "^3.0.5",
+    "hardhat": "^2.22.3"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts": "^5.0.2",
+    "@openzeppelin/contracts-upgradeable": "^5.0.2",
+    "dotenv": "^16.4.5"
+  }
+}
