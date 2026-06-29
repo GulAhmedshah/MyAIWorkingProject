@@ -4,275 +4,300 @@ pragma solidity ^0.8.19;
 import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/security/Pausable.sol";
-import "@openzeppelin/contracts/token/ERC721/extensions/IERC721Receiver.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/math/Math.sol";
 
 /**
  * @title NFTStaking
  * @author Your Name
  * @notice A contract for staking ERC721 NFTs to earn ERC20 token rewards.
- * @dev This contract allows users to stake NFTs from a specific collection and earn rewards over time.
- * It includes emergency functions, pausable state, and owner-only administrative functions.
+ * @dev This contract implements reentrancy guards, uses SafeERC20 for transfers,
+ * and includes comprehensive validation and event emissions for security and transparency.
+ * The reward calculation logic is based on the Synthetix StakingRewards model.
  */
-contract NFTStaking is Ownable, ReentrancyGuard, Pausable, IERC721Receiver {
+contract NFTStaking is ReentrancyGuard, Ownable {
     using SafeERC20 for IERC20;
 
-    /* =============================================================
-                               STATE VARIABLES
-    ============================================================== */
+    /* ========== STATE VARIABLES ========== */
 
-    /// @notice The ERC20 token used for rewards.
-    IERC20 public immutable rewardsToken;
-    /// @notice The ERC721 NFT collection that can be staked.
+    // Staking and Rewards Tokens
     IERC721 public immutable nftCollection;
+    IERC20 public immutable rewardsToken;
 
-    /// @notice The amount of reward tokens earned per second per staked NFT.
-    uint256 public rewardRate;
-    /// @notice The last timestamp when global rewards were updated.
-    uint256 public lastUpdateTime;
-    /// @notice The accumulated rewards per token, scaled by 1e18 for precision.
-    uint256 public rewardPerTokenStored;
+    // Staking Data
+    // Mapping from tokenId to the address of the staker.
+    mapping(uint256 => address) public stakerOf;
+    // Mapping from a staker's address to an array of their staked tokenIds.
+    mapping(address => uint256[]) private stakedTokens;
+    // Mapping from a tokenId to its index in the staker's stakedTokens array.
+    // This is used for efficient O(1) removal.
+    mapping(uint256 => uint256) private stakedTokenIndex;
+    // Total number of NFTs currently staked in the contract.
+    uint256 public totalStaked;
 
-    /// @notice Mapping from user address to their earned but unclaimed rewards.
+    // Reward Calculation Data
+    // Mapping from user address to their accumulated but unclaimed rewards.
     mapping(address => uint256) public rewards;
-    /// @notice Mapping from user to their last paid out reward-per-token value.
+    // The rate of reward distribution per second.
+    uint256 public rewardRate;
+    // The timestamp when the current reward period ends.
+    uint256 public periodFinish;
+    // The last time rewards were updated for any user.
+    uint256 public lastUpdateTime;
+    // The cumulative reward per staked token since the beginning.
+    uint256 public rewardPerTokenStored;
+    // Mapping to track the rewardPerTokenStored value for each user's last update.
     mapping(address => uint256) public userRewardPerTokenPaid;
-    /// @notice Mapping from tokenId to the staker's address.
-    mapping(uint256 => address) public stakedTokens;
 
-    /// @notice A struct to store staking information for each user.
-    struct Staker {
-        uint256 amountStaked;
-        uint256 timeOfLastUpdate;
-    }
 
-    /// @notice Mapping from user address to their staker information.
-    mapping(address => Staker) public stakers;
+    /* ========== EVENTS ========== */
 
-    /* =============================================================
-                                   EVENTS
-    ============================================================== */
-
-    /// @notice Emitted when a user stakes one or more NFTs.
-    event Staked(address indexed user, uint256[] tokenIds);
-    /// @notice Emitted when a user withdraws one or more NFTs.
-    event Withdrawn(address indexed user, uint256[] tokenIds);
-    /// @notice Emitted when a user claims their earned rewards.
+    event Staked(address indexed user, uint256 indexed tokenId);
+    event Unstaked(address indexed user, uint256 indexed tokenId);
     event RewardsClaimed(address indexed user, uint256 amount);
-    /// @notice Emitted when the owner updates the reward rate.
-    event RewardRateUpdated(uint256 newRate);
+    event RewardRateSet(uint256 newRate);
+    event RewardPeriodFinishSet(uint256 newPeriodFinish);
+    event RewardsNotified(uint256 amount);
 
-    /* =============================================================
-                                 MODIFIERS
-    ============================================================== */
+
+    /* ========== MODIFIERS ========== */
 
     /**
-     * @dev Modifier to update a user's reward entitlement before a state change.
-     * @param _account The address of the user whose rewards need to be updated.
+     * @dev Modifier to check if the given token ID exists in the NFT collection.
+     * @notice This check is implicitly performed by calling `nftCollection.ownerOf()`,
+     * which reverts if the token does not exist.
+     * @param tokenId The ID of the token to check.
      */
-    modifier updateReward(address _account) {
-        rewardPerTokenStored = rewardPerToken();
-        lastUpdateTime = block.timestamp;
-        rewards[_account] = earned(_account);
-        userRewardPerTokenPaid[_account] = rewardPerTokenStored;
-        stakers[_account].timeOfLastUpdate = block.timestamp;
+    modifier validToken(uint256 tokenId) {
+        // This will revert if the token does not exist, effectively checking its existence.
+        nftCollection.ownerOf(tokenId);
         _;
     }
 
-    /* =============================================================
-                               CONSTRUCTOR
-    ============================================================== */
+
+    /* ========== CONSTRUCTOR ========== */
 
     /**
-     * @notice Initializes the staking contract.
-     * @param _rewardsToken The address of the ERC20 rewards token.
-     * @param _nftCollection The address of the ERC721 NFT collection.
-     * @param _rewardRate The initial reward rate per second per NFT.
+     * @dev Initializes the contract with the NFT and rewards token addresses.
+     * @param _nftCollectionAddress The address of the ERC721 NFT collection contract.
+     * @param _rewardsTokenAddress The address of the ERC20 rewards token contract.
      */
-    constructor(address _rewardsToken, address _nftCollection, uint256 _rewardRate) {
-        require(_rewardsToken != address(0), "NFTStaking: Invalid rewards token address");
-        require(_nftCollection != address(0), "NFTStaking: Invalid NFT collection address");
-        require(_rewardRate > 0, "NFTStaking: Reward rate must be positive");
-
-        rewardsToken = IERC20(_rewardsToken);
-        nftCollection = IERC721(_nftCollection);
-        rewardRate = _rewardRate;
-        lastUpdateTime = block.timestamp;
-    }
-
-    /* =============================================================
-                               CORE LOGIC
-    ============================================================== */
-
-    /**
-     * @notice Stakes multiple NFTs.
-     * @dev The caller must approve the contract to transfer the NFTs first.
-     * @param tokenIds An array of token IDs to stake.
-     */
-    function stake(uint256[] calldata tokenIds) external nonReentrant whenNotPaused updateReward(msg.sender) {
-        uint256 numTokens = tokenIds.length;
-        require(numTokens > 0, "NFTStaking: No token IDs provided");
-
-        Staker storage staker = stakers[msg.sender];
-        staker.amountStaked += numTokens;
-
-        for (uint256 i = 0; i < numTokens; i++) {
-            uint256 tokenId = tokenIds[i];
-            require(nftCollection.ownerOf(tokenId) == msg.sender, "NFTStaking: Not the owner of the token");
-            require(stakedTokens[tokenId] == address(0), "NFTStaking: Token already staked");
-
-            stakedTokens[tokenId] = msg.sender;
-            nftCollection.safeTransferFrom(msg.sender, address(this), tokenId);
+    constructor(address _nftCollectionAddress, address _rewardsTokenAddress) {
+        if (_nftCollectionAddress == address(0)) {
+            revert("NFTStaking: NFT collection address cannot be zero");
+        }
+        if (_rewardsTokenAddress == address(0)) {
+            revert("NFTStaking: Rewards token address cannot be zero");
         }
 
-        emit Staked(msg.sender, tokenIds);
+        nftCollection = IERC721(_nftCollectionAddress);
+        rewardsToken = IERC20(_rewardsTokenAddress);
     }
 
+
+    /* ========== EXTERNAL VIEWS ========== */
+
     /**
-     * @notice Withdraws multiple staked NFTs and claims pending rewards.
-     * @param tokenIds An array of token IDs to withdraw.
+     * @dev Returns the list of token IDs staked by a specific user.
+     * @param _user The address of the user.
+     * @return An array of token IDs.
      */
-    function withdraw(uint256[] calldata tokenIds) external nonReentrant whenNotPaused updateReward(msg.sender) {
-        uint256 numTokens = tokenIds.length;
-        require(numTokens > 0, "NFTStaking: No token IDs provided");
-
-        Staker storage staker = stakers[msg.sender];
-        require(staker.amountStaked >= numTokens, "NFTStaking: Attempting to withdraw more than staked");
-
-        staker.amountStaked -= numTokens;
-
-        _claimRewards(msg.sender);
-
-        for (uint256 i = 0; i < numTokens; i++) {
-            uint256 tokenId = tokenIds[i];
-            require(stakedTokens[tokenId] == msg.sender, "NFTStaking: Not the owner of the token");
-
-            delete stakedTokens[tokenId];
-            nftCollection.safeTransferFrom(address(this), msg.sender, tokenId);
-        }
-
-        emit Withdrawn(msg.sender, tokenIds);
+    function getStakedTokens(address _user) external view returns (uint256[] memory) {
+        return stakedTokens[_user];
     }
 
     /**
-     * @notice Claims all pending rewards for the message sender.
-     */
-    function claimRewards() external nonReentrant whenNotPaused updateReward(msg.sender) {
-        _claimRewards(msg.sender);
-    }
-
-    /**
-     * @notice Withdraws staked NFTs without claiming rewards in an emergency.
-     * @dev This function bypasses reward calculations and the paused state.
-     * @param tokenIds The list of token IDs to withdraw.
-     */
-    function emergencyWithdraw(uint256[] calldata tokenIds) external nonReentrant {
-        uint256 numTokens = tokenIds.length;
-        require(numTokens > 0, "NFTStaking: No token IDs provided");
-
-        Staker storage staker = stakers[msg.sender];
-        require(staker.amountStaked >= numTokens, "NFTStaking: Attempting to withdraw more than staked");
-
-        staker.amountStaked -= numTokens;
-
-        for (uint256 i = 0; i < numTokens; i++) {
-            uint256 tokenId = tokenIds[i];
-            require(stakedTokens[tokenId] == msg.sender, "NFTStaking: Not the owner of the token");
-
-            delete stakedTokens[tokenId];
-            nftCollection.safeTransferFrom(address(this), msg.sender, tokenId);
-        }
-
-        emit Withdrawn(msg.sender, tokenIds);
-    }
-
-    /* =============================================================
-                               ADMIN FUNCTIONS
-    ============================================================== */
-
-    /**
-     * @notice Sets a new reward rate.
-     * @dev Updates accumulated rewards with the old rate before changing it.
-     * @param _newRate The new reward rate per second per NFT.
-     */
-    function setRewardRate(uint256 _newRate) external onlyOwner {
-        require(_newRate > 0, "NFTStaking: Rate must be greater than 0");
-        rewardPerTokenStored = rewardPerToken();
-        lastUpdateTime = block.timestamp;
-        rewardRate = _newRate;
-        emit RewardRateUpdated(_newRate);
-    }
-
-    /**
-     * @notice Pauses the contract, halting stake, withdraw, and claimRewards.
-     * @dev Can only be called by the owner. Emits a {Paused} event.
-     * Emergency functions will still be available.
-     */
-    function pause() external onlyOwner {
-        _pause();
-    }
-
-    /**
-     * @notice Unpauses the contract, resuming normal operations.
-     * @dev Can only be called by the owner. Emits an {Unpaused} event.
-     */
-    function unpause() external onlyOwner {
-        _unpause();
-    }
-
-    /* =============================================================
-                               VIEW FUNCTIONS
-    ============================================================== */
-
-    /**
-     * @notice Calculates the total rewards earned by a user.
+     * @dev Calculates the amount of rewards a user has earned but not yet claimed.
      * @param _account The address of the user.
      * @return The total rewards earned.
      */
     function earned(address _account) public view returns (uint256) {
-        Staker memory staker = stakers[_account];
+        uint256 userStakedCount = stakedTokens[_account].length;
+        if (userStakedCount == 0) {
+            return rewards[_account];
+        }
         return
-            ((staker.amountStaked * (rewardPerToken() - userRewardPerTokenPaid[_account])) / 1e18) +
+            (userStakedCount * (rewardPerToken() - userRewardPerTokenPaid[_account])) / 1e18 +
             rewards[_account];
     }
 
+
+    /* ========== EXTERNAL FUNCTIONS (Staking & Unstaking) ========== */
+
     /**
-     * @notice Calculates the reward per token since the last global update.
-     * @return The reward per token, scaled by 1e18.
+     * @dev Stakes one or more NFTs.
+     * @notice The caller must approve the contract to transfer the NFTs.
+     * @param _tokenIds An array of token IDs to stake.
      */
-    function rewardPerToken() public view returns (uint256) {
-        uint256 totalStaked = nftCollection.balanceOf(address(this));
+    function stake(uint256[] calldata _tokenIds) external nonReentrant updateReward(msg.sender) {
+        if (_tokenIds.length == 0) {
+            revert("NFTStaking: Cannot stake zero tokens");
+        }
+
+        for (uint256 i = 0; i < _tokenIds.length; ++i) {
+            uint256 tokenId = _tokenIds[i];
+
+            if (nftCollection.ownerOf(tokenId) != msg.sender) {
+                revert("NFTStaking: Caller is not the owner of the NFT");
+            }
+            if (stakerOf[tokenId] != address(0)) {
+                revert("NFTStaking: Token is already staked");
+            }
+
+            // Add token to user's staked list
+            stakedTokens[msg.sender].push(tokenId);
+            stakedTokenIndex[tokenId] = stakedTokens[msg.sender].length - 1;
+            stakerOf[tokenId] = msg.sender;
+
+            emit Staked(msg.sender, tokenId);
+
+            // Transfer NFT to the contract
+            nftCollection.safeTransferFrom(msg.sender, address(this), tokenId);
+        }
+        totalStaked += _tokenIds.length;
+    }
+
+    /**
+     * @dev Unstakes one or more NFTs.
+     * @param _tokenIds An array of token IDs to unstake.
+     */
+    function unstake(uint256[] calldata _tokenIds) external nonReentrant updateReward(msg.sender) {
+        if (_tokenIds.length == 0) {
+            revert("NFTStaking: Cannot unstake zero tokens");
+        }
+
+        for (uint256 i = 0; i < _tokenIds.length; ++i) {
+            uint256 tokenId = _tokenIds[i];
+
+            if (stakerOf[tokenId] != msg.sender) {
+                revert("NFTStaking: Caller is not the staker of the NFT");
+            }
+
+            // Efficiently remove token from user's staked list
+            _removeTokenFromStaker(msg.sender, tokenId);
+            delete stakerOf[tokenId];
+            delete stakedTokenIndex[tokenId];
+
+            emit Unstaked(msg.sender, tokenId);
+            
+            // Transfer NFT back to the staker
+            nftCollection.safeTransferFrom(address(this), msg.sender, tokenId);
+        }
+        totalStaked -= _tokenIds.length;
+    }
+
+    /* ========== EXTERNAL FUNCTIONS (Rewards) ========== */
+
+    /**
+     * @dev Claims all available rewards for the message sender.
+     */
+    function claimRewards() external nonReentrant updateReward(msg.sender) {
+        uint256 rewardAmount = rewards[msg.sender];
+        if (rewardAmount == 0) {
+            revert("NFTStaking: No rewards to claim");
+        }
+
+        rewards[msg.sender] = 0;
+        rewardsToken.safeTransfer(msg.sender, rewardAmount);
+
+        emit RewardsClaimed(msg.sender, rewardAmount);
+    }
+
+    /* ========== RESTRICTED FUNCTIONS (Owner) ========== */
+
+    /**
+     * @dev Funds the contract with reward tokens and sets the reward rate over a duration.
+     * @notice The contract must be approved to spend the owner's reward tokens.
+     * @notice This will start a new reward distribution period.
+     * @param _amount The total amount of reward tokens to distribute.
+     * @param _duration The duration over which to distribute the rewards, in seconds.
+     */
+    function notifyRewardAmount(uint256 _amount, uint256 _duration) external onlyOwner nonReentrant updateReward(address(0)) {
+        if (_amount == 0) {
+            revert("NFTStaking: Amount must be greater than zero");
+        }
+        if (_duration == 0) {
+            revert("NFTStaking: Duration must be greater than zero");
+        }
+
+        if (block.timestamp >= periodFinish) {
+            rewardRate = _amount / _duration;
+        } else {
+            uint256 remaining = periodFinish - block.timestamp;
+            uint256 leftover = remaining * rewardRate;
+            rewardRate = (_amount + leftover) / _duration;
+        }
+
+        if (rewardRate == 0) {
+            revert("NFTStaking: Reward rate cannot be zero, check amount and duration");
+        }
+
+        lastUpdateTime = block.timestamp;
+        periodFinish = block.timestamp + _duration;
+
+        // Transfer new rewards into the contract
+        rewardsToken.safeTransferFrom(msg.sender, address(this), _amount);
+
+        emit RewardsNotified(_amount);
+        emit RewardRateSet(rewardRate);
+        emit RewardPeriodFinishSet(periodFinish);
+    }
+
+
+    /* ========== INTERNAL & PRIVATE FUNCTIONS ========== */
+
+    /**
+     * @dev Modifier that updates the reward state for a given account.
+     * @param _account The account to update rewards for. `address(0)` updates global state only.
+     */
+    modifier updateReward(address _account) {
+        rewardPerTokenStored = rewardPerToken();
+        lastUpdateTime = lastTimeRewardApplicable();
+        if (_account != address(0)) {
+            rewards[_account] = earned(_account);
+            userRewardPerTokenPaid[_account] = rewardPerTokenStored;
+        }
+        _;
+    }
+
+    /**
+     * @dev Calculates the cumulative reward per token since the last update.
+     * @return The reward per token value, scaled by 1e18.
+     */
+    function rewardPerToken() internal view returns (uint256) {
         if (totalStaked == 0) {
             return rewardPerTokenStored;
         }
-        return rewardPerTokenStored + (((block.timestamp - lastUpdateTime) * rewardRate * 1e18) / totalStaked);
-    }
-
-    /* =============================================================
-                              INTERNAL FUNCTIONS
-    ============================================================== */
-
-    /**
-     * @dev Internal function to handle the reward claiming logic.
-     * @param _account The account to claim rewards for.
-     */
-    function _claimRewards(address _account) internal {
-        uint256 rewardAmount = rewards[_account];
-        if (rewardAmount > 0) {
-            rewards[_account] = 0;
-            rewardsToken.safeTransfer(_account, rewardAmount);
-            emit RewardsClaimed(_account, rewardAmount);
-        }
+        return
+            rewardPerTokenStored +
+            (((lastTimeRewardApplicable() - lastUpdateTime) * rewardRate * 1e18) / totalStaked);
     }
 
     /**
-     * @dev See {IERC721Receiver-onERC721Received}.
-     *      This contract is not designed to receive NFTs via direct transfer.
-     *      Always use the `stake` function.
+     * @dev Gets the timestamp for the last moment rewards are applicable.
+     * @return The minimum of the current block timestamp and the period finish time.
      */
-    function onERC721Received(address, address, uint256, bytes calldata) external pure override returns (bytes4) {
-        return this.onERC721Received.selector;
+    function lastTimeRewardApplicable() internal view returns (uint256) {
+        return Math.min(block.timestamp, periodFinish);
+    }
+
+    /**
+     * @dev Private function to remove a token from a staker's list efficiently.
+     * @notice Uses the "swap and pop" method for O(1) removal.
+     * @param _staker The address of the staker.
+     * @param _tokenId The ID of the token to remove.
+     */
+    function _removeTokenFromStaker(address _staker, uint256 _tokenId) private {
+        uint256[] storage tokens = stakedTokens[_staker];
+        uint256 index = stakedTokenIndex[_tokenId];
+        uint256 lastTokenId = tokens[tokens.length - 1];
+
+        // Move the last token to the position of the token being removed
+        tokens[index] = lastTokenId;
+        stakedTokenIndex[lastTokenId] = index;
+
+        // Remove the last element
+        tokens.pop();
     }
 }
