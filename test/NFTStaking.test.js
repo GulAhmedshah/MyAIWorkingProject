@@ -1,445 +1,413 @@
-const { expect } = require("chai");
-const { ethers, hre } = require("hardhat");
-const {
-  loadFixture,
-  time,
-} = require("@nomicfoundation/hardhat-network-helpers");
-
-describe("NFTStaking", function () {
-  const REWARDS_PER_SECOND = ethers.utils.parseEther("10"); // 10 tokens per second
-  const TOTAL_REWARD_SUPPLY = ethers.utils.parseEther("1000000"); // 1 million reward tokens
-
-  // A fixture to reuse the same setup in every test.
-  async function deployContractsFixture() {
-    // Contracts are deployed using the first signer/account by default
-    const [owner, staker1, staker2, otherAccount] = await ethers.getSigners();
-
-    // Deploy Mock NFT (ERC721)
-    const MyNFTFactory = await ethers.getContractFactory("MyNFT");
-    const myNFT = await MyNFTFactory.deploy();
-
-    // Deploy Mock Reward Token (ERC20)
-    const RewardsTokenFactory = await ethers.getContractFactory("RewardsToken");
-    const rewardsToken = await RewardsTokenFactory.deploy(TOTAL_REWARD_SUPPLY);
-
-    // Deploy NFTStaking contract
-    const NFTStakingFactory = await ethers.getContractFactory("NFTStaking");
-    const nftStaking = await NFTStakingFactory.deploy(
-      myNFT.address,
-      rewardsToken.address
-    );
-    
-    // Set the rewards per second
-    await nftStaking.setRewardsPerSecond(REWARDS_PER_SECOND);
-    
-    // Transfer reward tokens to the staking contract to be distributed
-    await rewardsToken.transfer(nftStaking.address, TOTAL_REWARD_SUPPLY);
-
-    // Mint NFTs for stakers
-    await myNFT.mint(staker1.address, 1);
-    await myNFT.mint(staker1.address, 2);
-    await myNFT.mint(staker2.address, 3);
-
-    return {
-      nftStaking,
-      myNFT,
-      rewardsToken,
-      owner,
-      staker1,
-      staker2,
-      otherAccount,
-    };
-  }
-
-  // Before all tests, create and compile mock contracts for testing purposes
-  before(async () => {
-    // In a real project, these mocks would be in separate .sol files under contracts/test/ or contracts/mocks/
-    const MyNFT = `
-      // SPDX-License-Identifier: MIT
-      pragma solidity ^0.8.19;
-      import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
-      contract MyNFT is ERC721 {
-        constructor() ERC721("My Test NFT", "MTN") {}
-        function mint(address to, uint256 tokenId) public {
-          _mint(to, tokenId);
-        }
-      }
-    `;
-    const RewardsToken = `
-      // SPDX-License-Identifier: MIT
-      pragma solidity ^0.8.19;
-      import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
-      contract RewardsToken is ERC20 {
-        constructor(uint256 initialSupply) ERC20("Rewards Token", "RWT") {
-          _mint(msg.sender, initialSupply);
-        }
-      }
-    `;
-    const fs = require("fs");
-    if (!fs.existsSync("contracts")) {
-      fs.mkdirSync("contracts");
-    }
-    fs.writeFileSync("contracts/MyNFT.sol", MyNFT.trim());
-    fs.writeFileSync("contracts/RewardsToken.sol", RewardsToken.trim());
-    await hre.run("compile");
-  });
-
-  // After all tests, clean up the mock contract files
-  after(async () => {
-      const fs = require("fs");
-      fs.unlinkSync("contracts/MyNFT.sol");
-      fs.unlinkSync("contracts/RewardsToken.sol");
-  });
-
-
-  describe("Deployment", function () {
-    it("Should set the right owner", async function () {
-      const { nftStaking, owner } = await loadFixture(deployContractsFixture);
-      expect(await nftStaking.owner()).to.equal(owner.address);
-    });
-
-    it("Should set the correct NFT and reward token addresses", async function () {
-      const { nftStaking, myNFT, rewardsToken } = await loadFixture(deployContractsFixture);
-      expect(await nftStaking.nftAddress()).to.equal(myNFT.address);
-      expect(await nftStaking.rewardsTokenAddress()).to.equal(rewardsToken.address);
-    });
-
-    it("Should set the correct rewards per second", async function () {
-        const { nftStaking } = await loadFixture(deployContractsFixture);
-        expect(await nftStaking.rewardsPerSecond()).to.equal(REWARDS_PER_SECOND);
-    });
-  });
-
-  describe("Staking", function () {
-    it("Should allow a user to stake an approved NFT", async function () {
-      const { nftStaking, myNFT, staker1 } = await loadFixture(deployContractsFixture);
-      const tokenId = 1;
-
-      await myNFT.connect(staker1).approve(nftStaking.address, tokenId);
-
-      const stakeTx = await nftStaking.connect(staker1).stake([tokenId]);
-      const receipt = await stakeTx.wait();
-      const block = await ethers.provider.getBlock(receipt.blockNumber);
-
-      expect(await myNFT.ownerOf(tokenId)).to.equal(nftStaking.address);
-      const stakerInfo = await nftStaking.getStakerInfo(staker1.address);
-      expect(stakerInfo.amountStaked).to.equal(1);
-      expect(stakerInfo.stakedTokens[0]).to.equal(tokenId);
-      
-      const stakedTokenInfo = await nftStaking.stakedTokens(tokenId);
-      expect(stakedTokenInfo.staker).to.equal(staker1.address);
-      expect(stakedTokenInfo.timestamp).to.equal(block.timestamp);
-
-      await expect(stakeTx)
-        .to.emit(nftStaking, "NFTStaked")
-        .withArgs(staker1.address, tokenId, block.timestamp);
-    });
-
-    it("Should not allow staking an NFT without approval", async function () {
-      const { nftStaking, staker1 } = await loadFixture(deployContractsFixture);
-      const tokenId = 1;
-      await expect(
-        nftStaking.connect(staker1).stake([tokenId])
-      ).to.be.revertedWith("ERC721: caller is not token owner nor approved");
-    });
-    
-    it("Should not allow staking an NFT not owned by the caller", async function () {
-        const { nftStaking, myNFT, staker1, staker2 } = await loadFixture(deployContractsFixture);
-        const tokenId = 1; // Owned by staker1
-  
-        await myNFT.connect(staker1).approve(staker2.address, tokenId); // staker1 approves staker2
-  
-        await expect(
-          nftStaking.connect(staker2).stake([tokenId]) // staker2 tries to stake staker1's NFT
-        ).to.be.revertedWithCustomError(nftStaking, "NFTStaking__NotOwner");
-    });
-
-    it("Should not allow staking an already staked NFT", async function () {
-      const { nftStaking, myNFT, staker1 } = await loadFixture(deployContractsFixture);
-      const tokenId = 1;
-
-      await myNFT.connect(staker1).approve(nftStaking.address, tokenId);
-      await nftStaking.connect(staker1).stake([tokenId]);
-
-      await expect(
-        nftStaking.connect(staker1).stake([tokenId])
-      ).to.be.revertedWithCustomError(nftStaking, "NFTStaking__AlreadyStaked");
-    });
-    
-    it("Should reject staking with an empty array", async function () {
-        const { nftStaking, staker1 } = await loadFixture(deployContractsFixture);
-        await expect(nftStaking.connect(staker1).stake([])).to.be.revertedWithCustomError(
-            nftStaking,
-            "NFTStaking__NoTokensProvided"
-        );
-    });
-
-    it("Should handle staking multiple NFTs", async function () {
-        const { nftStaking, myNFT, staker1 } = await loadFixture(deployContractsFixture);
-        const tokenIds = [1, 2];
-
-        await myNFT.connect(staker1).approve(nftStaking.address, tokenIds[0]);
-        await myNFT.connect(staker1).approve(nftStaking.address, tokenIds[1]);
-
-        await nftStaking.connect(staker1).stake(tokenIds);
-
-        expect(await myNFT.ownerOf(tokenIds[0])).to.equal(nftStaking.address);
-        expect(await myNFT.ownerOf(tokenIds[1])).to.equal(nftStaking.address);
-
-        const stakerInfo = await nftStaking.getStakerInfo(staker1.address);
-        expect(stakerInfo.amountStaked).to.equal(2);
-        expect(stakerInfo.stakedTokens).to.deep.equal(tokenIds.map(id => ethers.BigNumber.from(id)));
-    });
-  });
-
-  describe("Rewards", function () {
-    it("Should calculate rewards correctly for a single staker", async function () {
-        const { nftStaking, myNFT, staker1 } = await loadFixture(deployContractsFixture);
-        const tokenId = 1;
-        
-        await myNFT.connect(staker1).approve(nftStaking.address, tokenId);
-        await nftStaking.connect(staker1).stake([tokenId]);
-        
-        const stakeDuration = 100; // seconds
-        await time.increase(stakeDuration);
-        
-        const rewards = await nftStaking.calculateRewards(staker1.address);
-        const expectedRewards = REWARDS_PER_SECOND.mul(stakeDuration);
-        
-        expect(rewards).to.equal(expectedRewards);
-    });
-
-    it("Should correctly calculate rewards for multiple staked NFTs", async function () {
-        const { nftStaking, myNFT, staker1 } = await loadFixture(deployContractsFixture);
-        const tokenIds = [1, 2];
-    
-        await myNFT.connect(staker1).approve(nftStaking.address, tokenIds[0]);
-        await nftStaking.connect(staker1).stake([tokenIds[0]]);
-        
-        await time.increase(100); // 100 seconds pass
-        
-        await myNFT.connect(staker1).approve(nftStaking.address, tokenIds[1]);
-        await nftStaking.connect(staker1).stake([tokenIds[1]]);
-        
-        await time.increase(100); // another 100 seconds pass
-    
-        const rewards = await nftStaking.calculateRewards(staker1.address);
-        // NFT 1 staked for 200s, NFT 2 staked for 100s
-        const expectedRewards = REWARDS_PER_SECOND.mul(200).add(REWARDS_PER_SECOND.mul(100));
-    
-        expect(rewards).to.be.closeTo(expectedRewards, ethers.utils.parseEther("0.001"));
-    });
-
-    it("Should handle multiple stakers correctly", async function () {
-        const { nftStaking, myNFT, staker1, staker2 } = await loadFixture(deployContractsFixture);
-        
-        // Staker 1 stakes
-        await myNFT.connect(staker1).approve(nftStaking.address, 1);
-        await nftStaking.connect(staker1).stake([1]);
-        
-        await time.increase(50);
-        
-        // Staker 2 stakes
-        await myNFT.connect(staker2).approve(nftStaking.address, 3);
-        await nftStaking.connect(staker2).stake([3]);
-        
-        await time.increase(50);
-        
-        // Staker 1 has staked for 100 seconds (50 + 50)
-        const rewards1 = await nftStaking.calculateRewards(staker1.address);
-        const expectedRewards1 = REWARDS_PER_SECOND.mul(100);
-        expect(rewards1).to.equal(expectedRewards1);
-        
-        // Staker 2 has staked for 50 seconds
-        const rewards2 = await nftStaking.calculateRewards(staker2.address);
-        const expectedRewards2 = REWARDS_PER_SECOND.mul(50);
-        expect(rewards2).to.equal(expectedRewards2);
-    });
-  });
-
-  describe("Claiming and Withdrawing", function () {
-    it("Should allow a user to claim rewards without withdrawing", async function () {
-        const { nftStaking, myNFT, rewardsToken, staker1 } = await loadFixture(deployContractsFixture);
-        const tokenId = 1;
-        
-        await myNFT.connect(staker1).approve(nftStaking.address, tokenId);
-        await nftStaking.connect(staker1).stake([tokenId]);
-        
-        const stakeDuration = 100;
-        await time.increase(stakeDuration);
-        
-        const expectedRewards = REWARDS_PER_SECOND.mul(stakeDuration);
-
-        const claimTx = nftStaking.connect(staker1).claimRewards();
-
-        await expect(claimTx).to.changeTokenBalances(
-            rewardsToken,
-            [staker1, nftStaking],
-            [expectedRewards, expectedRewards.mul(-1)]
-        );
-        
-        // Rewards should be reset after claiming
-        const rewardsAfterClaim = await nftStaking.calculateRewards(staker1.address);
-        expect(rewardsAfterClaim).to.equal(0);
-        
-        // Staking info timestamp should be updated
-        const stakeInfo = await nftStaking.stakedTokens(tokenId);
-        const latestBlock = await ethers.provider.getBlock("latest");
-        expect(stakeInfo.timestamp).to.equal(latestBlock.timestamp);
-    });
-
-    it("Should allow a user to withdraw a staked NFT and claim rewards", async function () {
-        const { nftStaking, myNFT, rewardsToken, staker1 } = await loadFixture(deployContractsFixture);
-        const tokenId = 1;
-        
-        await myNFT.connect(staker1).approve(nftStaking.address, tokenId);
-        await nftStaking.connect(staker1).stake([tokenId]);
-        
-        const stakeDuration = 200;
-        await time.increase(stakeDuration);
-
-        const expectedRewards = REWARDS_PER_SECOND.mul(stakeDuration);
-        
-        const withdrawTx = await nftStaking.connect(staker1).withdraw([tokenId]);
-
-        // Check NFT is returned
-        expect(await myNFT.ownerOf(tokenId)).to.equal(staker1.address);
-
-        // Check rewards are paid
-        await expect(withdrawTx).to.changeTokenBalances(
-            rewardsToken,
-            [staker1, nftStaking],
-            [expectedRewards, expectedRewards.mul(-1)]
-        );
-        
-        // Check staking info is cleared
-        const stakerInfo = await nftStaking.getStakerInfo(staker1.address);
-        expect(stakerInfo.amountStaked).to.equal(0);
-        const stakeInfo = await nftStaking.stakedTokens(tokenId);
-        expect(stakeInfo.staker).to.equal(ethers.constants.AddressZero);
-
-        await expect(withdrawTx)
-            .to.emit(nftStaking, "NFTWithdrawn")
-            .withArgs(staker1.address, tokenId);
-    });
-
-    it("Should not allow a non-staker to withdraw an NFT", async function () {
-        const { nftStaking, myNFT, staker1, staker2 } = await loadFixture(deployContractsFixture);
-        const tokenId = 1;
-
-        await myNFT.connect(staker1).approve(nftStaking.address, tokenId);
-        await nftStaking.connect(staker1).stake([tokenId]);
-        
-        await expect(nftStaking.connect(staker2).withdraw([tokenId]))
-            .to.be.revertedWithCustomError(nftStaking, "NFTStaking__NotStaker");
-    });
-
-    it("Should not allow withdrawing a token that isn't staked", async function () {
-        const { nftStaking, staker1 } = await loadFixture(deployContractsFixture);
-        const tokenId = 99; // Not staked
-        
-        await expect(nftStaking.connect(staker1).withdraw([tokenId]))
-            .to.be.revertedWithCustomError(nftStaking, "NFTStaking__NotStaked");
-    });
-    
-    it("Should handle withdrawing multiple NFTs", async function () {
-        const { nftStaking, myNFT, rewardsToken, staker1 } = await loadFixture(deployContractsFixture);
-        const tokenIds = [1, 2];
-        
-        await myNFT.connect(staker1).setApprovalForAll(nftStaking.address, true);
-        await nftStaking.connect(staker1).stake(tokenIds);
-        
-        const stakeDuration = 150;
-        await time.increase(stakeDuration);
-
-        const expectedRewards = REWARDS_PER_SECOND.mul(stakeDuration).mul(tokenIds.length);
-        
-        const withdrawTx = nftStaking.connect(staker1).withdraw(tokenIds);
-
-        // Check NFTs are returned
-        expect(await myNFT.ownerOf(tokenIds[0])).to.equal(staker1.address);
-        expect(await myNFT.ownerOf(tokenIds[1])).to.equal(staker1.address);
-
-        // Check rewards are paid
-        await expect(withdrawTx).to.changeTokenBalances(
-            rewardsToken,
-            [staker1, nftStaking],
-            [expectedRewards, expectedRewards.mul(-1)]
-        );
-        
-        const stakerInfo = await nftStaking.getStakerInfo(staker1.address);
-        expect(stakerInfo.amountStaked).to.equal(0);
-    });
-
-    it("Should reject withdrawing with an empty array", async function () {
-        const { nftStaking, staker1 } = await loadFixture(deployContractsFixture);
-        await expect(nftStaking.connect(staker1).withdraw([])).to.be.revertedWithCustomError(
-            nftStaking,
-            "NFTStaking__NoTokensProvided"
-        );
-    });
-  });
-
-  describe("Edge Cases and Security", function () {
-    it("Should revert if trying to set zero address for NFT", async function () {
-        const { nftStaking, rewardsToken } = await loadFixture(deployContractsFixture);
-        const NFTStakingFactory = await ethers.getContractFactory("NFTStaking");
-        await expect(NFTStakingFactory.deploy(
-            ethers.constants.AddressZero,
-            rewardsToken.address
-        )).to.be.revertedWithCustomError(nftStaking, "NFTStaking__ZeroAddress");
-    });
-    
-    it("Should revert if trying to set zero address for reward token", async function () {
-        const { nftStaking, myNFT } = await loadFixture(deployContractsFixture);
-        const NFTStakingFactory = await ethers.getContractFactory("NFTStaking");
-        await expect(NFTStakingFactory.deploy(
-            myNFT.address,
-            ethers.constants.AddressZero
-        )).to.be.revertedWithCustomError(nftStaking, "NFTStaking__ZeroAddress");
-    });
-    
-    it("Should revert if non-owner tries to change rewards per second", async function () {
-        const { nftStaking, staker1 } = await loadFixture(deployContractsFixture);
-        const newRate = ethers.utils.parseEther("5");
-        await expect(nftStaking.connect(staker1).setRewardsPerSecond(newRate))
-            .to.be.revertedWith("Ownable: caller is not the owner");
-    });
-
-    it("Should correctly update rewards for a staker after they claim", async function () {
-        const { nftStaking, myNFT, staker1 } = await loadFixture(deployContractsFixture);
-        const tokenId = 1;
-        
-        await myNFT.connect(staker1).setApprovalForAll(nftStaking.address, true);
-        await nftStaking.connect(staker1).stake([tokenId]);
-        
-        await time.increase(100);
-        await nftStaking.connect(staker1).claimRewards(); // Claim after 100s
-        
-        await time.increase(50); // Wait another 50s
-        
-        const rewards = await nftStaking.calculateRewards(staker1.address);
-        const expectedRewards = REWARDS_PER_SECOND.mul(50); // Should only be for the last 50s
-        
-        expect(rewards).to.be.closeTo(expectedRewards, ethers.utils.parseEther("0.001"));
-    });
-    
-    it("Should revert reward transfer if contract has insufficient balance", async function() {
-        const { nftStaking, myNFT, rewardsToken, owner, staker1 } = await loadFixture(deployContractsFixture);
-        
-        // Drain the staking contract of its reward tokens
-        const balance = await rewardsToken.balanceOf(nftStaking.address);
-        await nftStaking.connect(owner).emergencyRewardWithdraw(balance);
-        
-        // Staker 1 stakes
-        await myNFT.connect(staker1).setApprovalForAll(nftStaking.address, true);
-        await nftStaking.connect(staker1).stake([1]);
-        
-        await time.increase(100);
-        
-        // Staker 1 tries to claim rewards
-        await expect(nftStaking.connect(staker1).claimRewards())
-            .to.be.revertedWith("ERC20: transfer amount exceeds balance");
-    });
-  });
-});
+Y29uc3QgeyBleHBlY3QgfSA9IHJlcXVpcmUoImNoYWkiKTsKY29uc3QgeyBl
+dGhlcnMsIGhyZSB9ID0gcmVxdWlyZSgiaGFyZGhhdCIpOwpjb25zdCB7CiAg
+bG9hZEZpeHR1cmUsCiAgdGltZSwKfSA9IHJlcXVpcmUoIkBub21pY2ZvdW5k
+YXRpb24vaGFyZGhhdC1uZXR3b3JrLWhlbHBlcnMiKTsKCmRlc2NyaWJlKCJO
+RlRTdGFraW5nIiwgZnVuY3Rpb24gKCkgewogIGNvbnN0IFJFV0FSRFNfUEVS
+X1NFQ09ORCA9IGV0aGVycy51dGlscy5wYXJzZUV0aGVyKCIxMCIpOyAvLyAx
+MCB0b2tlbnMgcGVyIHNlY29uZAogIGNvbnN0IFRPVEFMX1JFV0FSRF9TVVBQ
+TFkgPSBldGhlcnMudXRpbHMucGFyc2VFdGhlcigiMTAwMDAwMCIpOyAvLyAx
+IG1pbGxpb24gcmV3YXJkIHRva2VucwoKICAvLyBBIGZpeHR1cmUgdG8gcmV1
+c2UgdGhlIHNhbWUgc2V0dXAgaW4gZXZlcnkgdGVzdC4KICBhc3luYyBmdW5j
+dGlvbiBkZXBsb3lDb250cmFjdHNGaXh0dXJlKCkgewogICAgLy8gQ29udHJh
+Y3RzIGFyZSBkZXBsb3llZCB1c2luZyB0aGUgZmlyc3Qgc2lnbmVyL2FjY291
+bnQgYnkgZGVmYXVsdAogICAgY29uc3QgW293bmVyLCBzdGFrZXIxLCBzdGFr
+ZXIyLCBvdGhlckFjY291bnRdID0gYXdhaXQgZXRoZXJzLmdldFNpZ25lcnMo
+KTsKCiAgICAvLyBEZXBsb3kgTW9jayBORlQgKEVSQzcyMSkKICAgIGNvbnN0
+IE15TkZURmFjdG9yeSA9IGF3YWl0IGV0aGVycy5nZXRDb250cmFjdEZhY3Rv
+cnkoIk15TkZUIik7CiAgICBjb25zdCBteU5GVCA9IGF3YWl0IE15TkZURmFj
+dG9yeS5kZXBsb3koKTsKCiAgICAvLyBEZXBsb3kgTW9jayBSZXdhcmQgVG9r
+ZW4gKEVSQzIwKQogICAgY29uc3QgUmV3YXJkc1Rva2VuRmFjdG9yeSA9IGF3
+YWl0IGV0aGVycy5nZXRDb250cmFjdEZhY3RvcnkoIlJld2FyZHNUb2tlbiIp
+OwogICAgY29uc3QgcmV3YXJkc1Rva2VuID0gYXdhaXQgUmV3YXJkc1Rva2Vu
+RmFjdG9yeS5kZXBsb3koVE9UQUxfUkVXQVJEX1NVUFBMWSk7CgogICAgLy8g
+RGVwbG95IE5GVFN0YWtpbmcgY29udHJhY3QKICAgIGNvbnN0IE5GVFN0YWtp
+bmdGYWN0b3J5ID0gYXdhaXQgZXRoZXJzLmdldENvbnRyYWN0RmFjdG9yeSgi
+TkZUU3Rha2luZyIpOwogICAgY29uc3QgbmZ0U3Rha2luZyA9IGF3YWl0IE5G
+VFN0YWtpbmdGYWN0b3J5LmRlcGxveSgKICAgICAgbXlORlQuYWRkcmVzcywK
+ICAgICAgcmV3YXJkc1Rva2VuLmFkZHJlc3MKICAgICk7CiAgICAKICAgIC8v
+IFNldCB0aGUgcmV3YXJkcyBwZXIgc2Vjb25kCiAgICBhd2FpdCBuZnRTdGFr
+aW5nLnNldFJld2FyZHNQZXJTZWNvbmQoUkVXQVJEU19QRVJfU0VDT05EKTsK
+ICAgIAogICAgLy8gVHJhbnNmZXIgcmV3YXJkIHRva2VucyB0byB0aGUgc3Rh
+a2luZyBjb250cmFjdCB0byBiZSBkaXN0cmlidXRlZAogICAgYXdhaXQgcmV3
+YXJkc1Rva2VuLnRyYW5zZmVyKG5mdFN0YWtpbmcuYWRkcmVzcywgVE9UQUxf
+UkVXQVJEX1NVUFBMWSk7CgogICAgLy8gTWludCBORlRzIGZvciBzdGFrZXJz
+CiAgICBhd2FpdCBteU5GVC5taW50KHN0YWtlcjEuYWRkcmVzcywgMSk7CiAg
+ICBhd2FpdCBteU5GVC5taW50KHN0YWtlcjEuYWRkcmVzcywgMik7CiAgICBh
+d2FpdCBteU5GVC5taW50KHN0YWtlcjIuYWRkcmVzcywgMyk7CgogICAgcmV0
+dXJuIHsKICAgICAgbmZ0U3Rha2luZywKICAgICAgbXlORlQsCiAgICAgIHJl
+d2FyZHNUb2tlbiwKICAgICAgb3duZXIsCiAgICAgIHN0YWtlcjEsCiAgICAg
+IHN0YWtlcjIsCiAgICAgIG90aGVyQWNjb3VudCwKICAgIH07CiAgfQoKICAv
+LyBCZWZvcmUgYWxsIHRlc3RzLCBjcmVhdGUgYW5kIGNvbXBpbGUgbW9jayBj
+b250cmFjdHMgZm9yIHRlc3RpbmcgcHVycG9zZXMKICBiZWZvcmUoYXN5bmMg
+KCkgPT4gewogICAgLy8gSW4gYSByZWFsIHByb2plY3QsIHRoZXNlIG1vY2tz
+IHdvdWxkIGJlIGluIHNlcGFyYXRlIC5zb2wgZmlsZXMgdW5kZXIgY29udHJh
+Y3RzL3Rlc3QvIG9yIGNvbnRyYWN0cy9tb2Nrcy8KICAgIGNvbnN0IE15TkZU
+ID0gYAogICAgICAvLyBTUERYLUxpY2Vuc2UtSWRlbnRpZmllcjogTUlUCiAg
+ICAgIHByYWdtYSBzb2xpZGl0eSBeMC44LjE5OwogICAgICBpbXBvcnQgIkBv
+cGVuemVwcGVsaW4vY29udHJhY3RzL3Rva2VuL0VSQzcyMS9FUkM3MjEuc29s
+IjsKICAgICAgY29udHJhY3QgTXlORlQgaXMgRVJDNzIxIHsKICAgICAgICBj
+b25zdHJ1Y3RvcigpIEVSQzcyMSgiTXkgVGVzdCBORlQiLCAiTVROIikge30K
+ICAgICAgICBmdW5jdGlvbiBtaW50KGFkZHJlc3MgdG8sIHVpbnQyNTYgdG9r
+ZW5JZCkgcHVibGljIHsKICAgICAgICAgIF9taW50KHRvLCB0b2tlbklkKTsK
+ICAgICAgICB9CiAgICAgIH0KICAgIGA7CiAgICBjb25zdCBSZXdhcmRzVG9r
+ZW4gPSBgCiAgICAgIC8vIFNQRFgtTGljZW5zZS1JZGVudGlmaWVyOiBNSVQK
+ICAgICAgcHJhZ21hIHNvbGlkaXR5IF4wLjguMTk7CiAgICAgIGltcG9ydCAi
+QG9wZW56ZXBwZWxpbi9jb250cmFjdHMvdG9rZW4vRVJDMjAvRVJDMjAuc29s
+IjsKICAgICAgY29udHJhY3QgUmV3YXJkc1Rva2VuIGlzIEVSQzIwIHsKICAg
+ICAgICBjb25zdHJ1Y3Rvcih1aW50MjU2IGluaXRpYWxTdXBwbHkpIEVSQzIw
+KCJSZXdhcmRzIFRva2VuIiwgIlJXVCIpIHsKICAgICAgICAgIF9taW50KG1z
+Zy5zZW5kZXIsIGluaXRpYWxTdXBwbHkpOwogICAgICAgIH0KICAgICAgfQog
+ICAgYDsKICAgIGNvbnN0IGZzID0gcmVxdWlyZSgiZnMiKTsKICAgIGlmICgh
+ZnMuZXhpc3RzU3luYygiY29udHJhY3RzIikpIHsKICAgICAgZnMubWtkaXJT
+eW5jKCJjb250cmFjdHMiKTsKICAgIH0KICAgIGZzLndyaXRlRmlsZVN5bmMo
+ImNvbnRyYWN0cy9NeU5GVC5zb2wiLCBNeU5GVC50cmltKCkpOwogICAgZnMu
+d3JpdGVGaWxlU3luYygiY29udHJhY3RzL1Jld2FyZHNUb2tlbi5zb2wiLCBS
+ZXdhcmRzVG9rZW4udHJpbSgpKTsKICAgIGF3YWl0IGhyZS5ydW4oImNvbXBp
+bGUiKTsKICB9KTsKCiAgLy8gQWZ0ZXIgYWxsIHRlc3RzLCBjbGVhbiB1cCB0
+aGUgbW9jayBjb250cmFjdCBmaWxlcwogIGFmdGVyKGFzeW5jICgpID0+IHsK
+ICAgICAgY29uc3QgZnMgPSByZXF1aXJlKCJmcyIpOwogICAgICBmcy51bmxp
+bmtTeW5jKCJjb250cmFjdHMvTXlORlQuc29sIik7CiAgICAgIGZzLnVubGlu
+a1N5bmMoImNvbnRyYWN0cy9SZXdhcmRzVG9rZW4uc29sIik7CiAgfSk7CgoK
+ICBkZXNjcmliZSgiRGVwbG95bWVudCIsIGZ1bmN0aW9uICgpIHsKICAgIGl0
+KCJTaG91bGQgc2V0IHRoZSByaWdodCBvd25lciIsIGFzeW5jIGZ1bmN0aW9u
+ICgpIHsKICAgICAgY29uc3QgeyBuZnRTdGFraW5nLCBvd25lciB9ID0gYXdh
+aXQgbG9hZEZpeHR1cmUoZGVwbG95Q29udHJhY3RzRml4dHVyZSk7CiAgICAg
+IGV4cGVjdChhd2FpdCBuZnRTdGFraW5nLm93bmVyKCkpLnRvLmVxdWFsKG93
+bmVyLmFkZHJlc3MpOwogICAgfSk7CgogICAgaXQoIlNob3VsZCBzZXQgdGhl
+IGNvcnJlY3QgTkZUIGFuZCByZXdhcmQgdG9rZW4gYWRkcmVzc2VzIiwgYXN5
+bmMgZnVuY3Rpb24gKCkgewogICAgICBjb25zdCB7IG5mdFN0YWtpbmcsIG15
+TkZULCByZXdhcmRzVG9rZW4gfSA9IGF3YWl0IGxvYWRGaXh0dXJlKGRlcGxv
+eUNvbnRyYWN0c0ZpeHR1cmUpOwogICAgICBleHBlY3QoYXdhaXQgbmZ0U3Rh
+a2luZy5uZnRBZGRyZXNzKCkpLnRvLmVxdWFsKG15TkZULmFkZHJlc3MpOwog
+ICAgICBleHBlY3QoYXdhaXQgbmZ0U3Rha2luZy5yZXdhcmRzVG9rZW5BZGRy
+ZXNzKCkpLnRvLmVxdWFsKHJld2FyZHNUb2tlbi5hZGRyZXNzKTsKICAgIH0p
+OwoKICAgIGl0KCJTaG91bGQgc2V0IHRoZSBjb3JyZWN0IHJld2FyZHMgcGVy
+IHNlY29uZCIsIGFzeW5jIGZ1bmN0aW9uICgpIHsKICAgICAgICBjb25zdCB7
+IG5mdFN0YWtpbmcgfSA9IGF3YWl0IGxvYWRGaXh0dXJlKGRlcGxveUNvbnRy
+YWN0c0ZpeHR1cmUpOwogICAgICAgIGV4cGVjdChhd2FpdCBuZnRTdGFraW5n
+LnJld2FyZHNQZXJTZWNvbmQoKSkudG8uZXF1YWwoUkVXQVJEU19QRVJfU0VD
+T05EKTsKICAgIH0pOwogIH0pOwoKICBkZXNjcmliZSgiU3Rha2luZyIsIGZ1
+bmN0aW9uICgpIHsKICAgIGl0KCJTaG91bGQgYWxsb3cgYSB1c2VyIHRvIHN0
+YWtlIGFuIGFwcHJvdmVkIE5GVCIsIGFzeW5jIGZ1bmN0aW9uICgpIHsKICAg
+ICAgY29uc3QgeyBuZnRTdGFraW5nLCBteU5GVCwgc3Rha2VyMSB9ID0gYXdh
+aXQgbG9hZEZpeHR1cmUoZGVwbG95Q29udHJhY3RzRml4dHVyZSk7CiAgICAg
+IGNvbnN0IHRva2VuSWQgPSAxOwoKICAgICAgYXdhaXQgbXlORlQuY29ubmVj
+dChzdGFrZXIxKS5hcHByb3ZlKG5mdFN0YWtpbmcuYWRkcmVzcywgdG9rZW5J
+ZCk7CgogICAgICBjb25zdCBzdGFrZVR4ID0gYXdhaXQgbmZ0U3Rha2luZy5j
+b25uZWN0KHN0YWtlcjEpLnN0YWtlKFt0b2tlbklkXSk7CiAgICAgIGNvbnN0
+IHJlY2VpcHQgPSBhd2FpdCBzdGFrZVR4LndhaXQoKTsKICAgICAgY29uc3Qg
+YmxvY2sgPSBhd2FpdCBldGhlcnMucHJvdmlkZXIuZ2V0QmxvY2socmVjZWlw
+dC5ibG9ja051bWJlcik7CgogICAgICBleHBlY3QoYXdhaXQgbXlORlQub3du
+ZXJPZih0b2tlbklkKSkudG8uZXF1YWwobmZ0U3Rha2luZy5hZGRyZXNzKTsK
+ICAgICAgY29uc3Qgc3Rha2VySW5mbyA9IGF3YWl0IG5mdFN0YWtpbmcuZ2V0
+U3Rha2VySW5mbyhzdGFrZXIxLmFkZHJlc3MpOwogICAgICBleHBlY3Qoc3Rh
+a2VySW5mby5hbW91bnRTdGFrZWQpLnRvLmVxdWFsKDEpOwogICAgICBleHBl
+Y3Qoc3Rha2VySW5mby5zdGFrZWRUb2tlbnNbMF0pLnRvLmVxdWFsKHRva2Vu
+SWQpOwogICAgICAKICAgICAgY29uc3Qgc3Rha2VkVG9rZW5JbmZvID0gYXdh
+aXQgbmZ0U3Rha2luZy5zdGFrZWRUb2tlbnModG9rZW5JZCk7CiAgICAgIGV4
+cGVjdChzdGFrZWRUb2tlbkluZm8uc3Rha2VyKS50by5lcXVhbChzdGFrZXIx
+LmFkZHJlc3MpOwogICAgICBleHBlY3Qoc3Rha2VkVG9rZW5JbmZvLnRpbWVz
+dGFtcCkudG8uZXF1YWwoYmxvY2sudGltZXN0YW1wKTsKCiAgICAgIGF3YWl0
+IGV4cGVjdChzdGFrZVR4KQogICAgICAgIC50by5lbWl0KG5mdFN0YWtpbmcs
+ICJORlRTdGFrZWQiKQogICAgICAgIC53aXRoQXJncyhzdGFrZXIxLmFkZHJl
+c3MsIHRva2VuSWQsIGJsb2NrLnRpbWVzdGFtcCk7CiAgICB9KTsKCiAgICBp
+dCgiU2hvdWxkIG5vdCBhbGxvdyBzdGFraW5nIGFuIE5GVCB3aXRob3V0IGFw
+cHJvdmFsIiwgYXN5bmMgZnVuY3Rpb24gKCkgewogICAgICBjb25zdCB7IG5m
+dFN0YWtpbmcsIHN0YWtlcjEgfSA9IGF3YWl0IGxvYWRGaXh0dXJlKGRlcGxv
+eUNvbnRyYWN0c0ZpeHR1cmUpOwogICAgICBjb25zdCB0b2tlbklkID0gMTsK
+ICAgICAgYXdhaXQgZXhwZWN0KAogICAgICAgIG5mdFN0YWtpbmcuY29ubmVj
+dChzdGFrZXIxKS5zdGFrZShbdG9rZW5JZF0pCiAgICAgICkudG8uYmUucmV2
+ZXJ0ZWRXaXRoKCJFUkM3MjE6IGNhbGxlciBpcyBub3QgdG9rZW4gb3duZXIg
+bm9yIGFwcHJvdmVkIik7CiAgICB9KTsKICAgIAogICAgaXQoIlNob3VsZCBu
+b3QgYWxsb3cgc3Rha2luZyBhbiBORlQgbm90IG93bmVkIGJ5IHRoZSBjYWxs
+ZXIiLCBhc3luYyBmdW5jdGlvbiAoKSB7CiAgICAgICAgY29uc3QgeyBuZnRT
+dGFraW5nLCBteU5GVCwgc3Rha2VyMSwgc3Rha2VyMiB9ID0gYXdhaXQgbG9h
+ZEZpeHR1cmUoZGVwbG95Q29udHJhY3RzRml4dHVyZSk7CiAgICAgICAgY29u
+c3QgdG9rZW5JZCA9IDE7IC8vIE93bmVkIGJ5IHN0YWtlcjEKICAKICAgICAg
+ICBhd2FpdCBteU5GVC5jb25uZWN0KHN0YWtlcjEpLmFwcHJvdmUoc3Rha2Vy
+Mi5hZGRyZXNzLCB0b2tlbklkKTsgLy8gc3Rha2VyMSBhcHByb3ZlcyBzdGFr
+ZXIyCiAgCiAgICAgICAgYXdhaXQgZXhwZWN0KAogICAgICAgICAgbmZ0U3Rh
+a2luZy5jb25uZWN0KHN0YWtlcjIpLnN0YWtlKFt0b2tlbklkXSkgLy8gc3Rh
+a2VyMiB0cmllcyB0byBzdGFrZSBzdGFrZXIxJ3MgTkZUCiAgICAgICAgKS50
+by5iZS5yZXZlcnRlZFdpdGhDdXN0b21FcnJvcihuZnRTdGFraW5nLCAiTkZU
+U3Rha2luZ19fTm90T3duZXIiKTsKICAgIH0pOwoKICAgIGl0KCJTaG91bGQg
+bm90IGFsbG93IHN0YWtpbmcgYW4gYWxyZWFkeSBzdGFrZWQgTkZUIiwgYXN5
+bmMgZnVuY3Rpb24gKCkgewogICAgICBjb25zdCB7IG5mdFN0YWtpbmcsIG15
+TkZULCBzdGFrZXIxIH0gPSBhd2FpdCBsb2FkRml4dHVyZShkZXBsb3lDb250
+cmFjdHNGaXh0dXJlKTsKICAgICAgY29uc3QgdG9rZW5JZCA9IDE7CgogICAg
+ICBhd2FpdCBteU5GVC5jb25uZWN0KHN0YWtlcjEpLmFwcHJvdmUobmZ0U3Rh
+a2luZy5hZGRyZXNzLCB0b2tlbklkKTsKICAgICAgYXdhaXQgbmZ0U3Rha2lu
+Zy5jb25uZWN0KHN0YWtlcjEpLnN0YWtlKFt0b2tlbklkXSk7CgogICAgICBh
+d2FpdCBleHBlY3QoCiAgICAgICAgbmZ0U3Rha2luZy5jb25uZWN0KHN0YWtl
+cjEpLnN0YWtlKFt0b2tlbklkXSkKICAgICAgKS50by5iZS5yZXZlcnRlZFdp
+dGhDdXN0b21FcnJvcihuZnRTdGFraW5nLCAiTkZUU3Rha2luZ19fQWxyZWFk
+eVN0YWtlZCIpOwogICAgfSk7CiAgICAKICAgIGl0KCJTaG91bGQgcmVqZWN0
+IHN0YWtpbmcgd2l0aCBhbiBlbXB0eSBhcnJheSIsIGFzeW5jIGZ1bmN0aW9u
+ICgpIHsKICAgICAgICBjb25zdCB7IG5mdFN0YWtpbmcsIHN0YWtlcjEgfSA9
+IGF3YWl0IGxvYWRGaXh0dXJlKGRlcGxveUNvbnRyYWN0c0ZpeHR1cmUpOwog
+ICAgICAgIGF3YWl0IGV4cGVjdChuZnRTdGFraW5nLmNvbm5lY3Qoc3Rha2Vy
+MSkuc3Rha2UoW10pKS50by5iZS5yZXZlcnRlZFdpdGhDdXN0b21FcnJvcigK
+ICAgICAgICAgICAgbmZ0U3Rha2luZywKICAgICAgICAgICAgIk5GVFN0YWtp
+bmdfX05vVG9rZW5zUHJvdmlkZWQiCiAgICAgICAgKTsKICAgIH0pOwoKICAg
+IGl0KCJTaG91bGQgaGFuZGxlIHN0YWtpbmcgbXVsdGlwbGUgTkZUcyIsIGFz
+eW5jIGZ1bmN0aW9uICgpIHsKICAgICAgICBjb25zdCB7IG5mdFN0YWtpbmcs
+IG15TkZULCBzdGFrZXIxIH0gPSBhd2FpdCBsb2FkRml4dHVyZShkZXBsb3lD
+b250cmFjdHNGaXh0dXJlKTsKICAgICAgICBjb25zdCB0b2tlbklkcyA9IFsx
+LCAyXTsKCiAgICAgICAgYXdhaXQgbXlORlQuY29ubmVjdChzdGFrZXIxKS5h
+cHByb3ZlKG5mdFN0YWtpbmcuYWRkcmVzcywgdG9rZW5JZHNbMF0pOwogICAg
+ICAgIGF3YWl0IG15TkZULmNvbm5lY3Qoc3Rha2VyMSkuYXBwcm92ZShuZnRT
+dGFraW5nLmFkZHJlc3MsIHRva2VuSWRzWzFdKTsKCiAgICAgICAgYXdhaXQg
+bmZ0U3Rha2luZy5jb25uZWN0KHN0YWtlcjEpLnN0YWtlKHRva2VuSWRzKTsK
+CiAgICAgICAgZXhwZWN0KGF3YWl0IG15TkZULm93bmVyT2YodG9rZW5JZHNb
+MF0pKS50by5lcXVhbChuZnRTdGFraW5nLmFkZHJlc3MpOwogICAgICAgIGV4
+cGVjdChhd2FpdCBteU5GVC5vd25lck9mKHRva2VuSWRzWzFdKSkudG8uZXF1
+YWwobmZ0U3Rha2luZy5hZGRyZXNzKTsKCiAgICAgICAgY29uc3Qgc3Rha2Vy
+SW5mbyA9IGF3YWl0IG5mdFN0YWtpbmcuZ2V0U3Rha2VySW5mbyhzdGFrZXIx
+LmFkZHJlc3MpOwogICAgICAgIGV4cGVjdChzdGFrZXJJbmZvLmFtb3VudFN0
+YWtlZCkudG8uZXF1YWwoMik7CiAgICAgICAgZXhwZWN0KHN0YWtlckluZm8u
+c3Rha2VkVG9rZW5zKS50by5kZWVwLmVxdWFsKHRva2VuSWRzLm1hcChpZCA9
+PiBldGhlcnMuQmlnTnVtYmVyLmZyb20oaWQpKSk7CiAgICB9KTsKICB9KTsK
+CiAgZGVzY3JpYmUoIlJld2FyZHMiLCBmdW5jdGlvbiAoKSB7CiAgICBpdCgi
+U2hvdWxkIGNhbGN1bGF0ZSByZXdhcmRzIGNvcnJlY3RseSBmb3IgYSBzaW5n
+bGUgc3Rha2VyIiwgYXN5bmMgZnVuY3Rpb24gKCkgewogICAgICAgIGNvbnN0
+IHsgbmZ0U3Rha2luZywgbXlORlQsIHN0YWtlcjEgfSA9IGF3YWl0IGxvYWRG
+aXh0dXJlKGRlcGxveUNvbnRyYWN0c0ZpeHR1cmUpOwogICAgICAgIGNvbnN0
+IHRva2VuSWQgPSAxOwogICAgICAgIAogICAgICAgIGF3YWl0IG15TkZULmNv
+bm5lY3Qoc3Rha2VyMSkuYXBwcm92ZShuZnRTdGFraW5nLmFkZHJlc3MsIHRv
+a2VuSWQpOwogICAgICAgIGF3YWl0IG5mdFN0YWtpbmcuY29ubmVjdChzdGFr
+ZXIxKS5zdGFrZShbdG9rZW5JZF0pOwogICAgICAgIAogICAgICAgIGNvbnN0
+IHN0YWtlRHVyYXRpb24gPSAxMDA7IC8vIHNlY29uZHMKICAgICAgICBhd2Fp
+dCB0aW1lLmluY3JlYXNlKHN0YWtlRHVyYXRpb24pOwogICAgICAgIAogICAg
+ICAgIGNvbnN0IHJld2FyZHMgPSBhd2FpdCBuZnRTdGFraW5nLmNhbGN1bGF0
+ZVJld2FyZHMoc3Rha2VyMS5hZGRyZXNzKTsKICAgICAgICBjb25zdCBleHBl
+Y3RlZFJld2FyZHMgPSBSRVdBUkRTX1BFUl9TRUNPTkQubXVsKHN0YWtlRHVy
+YXRpb24pOwogICAgICAgIAogICAgICAgIGV4cGVjdChyZXdhcmRzKS50by5l
+cXVhbChleHBlY3RlZFJld2FyZHMpOwogICAgfSk7CgogICAgaXQoIlNob3Vs
+ZCBjb3JyZWN0bHkgY2FsY3VsYXRlIHJld2FyZHMgZm9yIG11bHRpcGxlIHN0
+YWtlZCBORlRzIiwgYXN5bmMgZnVuY3Rpb24gKCkgewogICAgICAgIGNvbnN0
+IHsgbmZ0U3Rha2luZywgbXlORlQsIHN0YWtlcjEgfSA9IGF3YWl0IGxvYWRG
+aXh0dXJlKGRlcGxveUNvbnRyYWN0c0ZpeHR1cmUpOwogICAgICAgIGNvbnN0
+IHRva2VuSWRzID0gWzEsIDJdOwogICAgCiAgICAgICAgYXdhaXQgbXlORlQu
+Y29ubmVjdChzdGFrZXIxKS5hcHByb3ZlKG5mdFN0YWtpbmcuYWRkcmVzcywg
+dG9rZW5JZHNbMF0pOwogICAgICAgIGF3YWl0IG5mdFN0YWtpbmcuY29ubmVj
+dChzdGFrZXIxKS5zdGFrZShbdG9rZW5JZHNbMF1dKTsKICAgICAgICAKICAg
+ICAgICBhd2FpdCB0aW1lLmluY3JlYXNlKDEwMCk7IC8vIDEwMCBzZWNvbmRz
+IHBhc3MKICAgICAgICAKICAgICAgICBhd2FpdCBteU5GVC5jb25uZWN0KHN0
+YWtlcjEpLmFwcHJvdmUobmZ0U3Rha2luZy5hZGRyZXNzLCB0b2tlbklkc1sx
+XSk7CiAgICAgICAgYXdhaXQgbmZ0U3Rha2luZy5jb25uZWN0KHN0YWtlcjEp
+LnN0YWtlKFt0b2tlbklkc1sxXV0pOwogICAgICAgIAogICAgICAgIGF3YWl0
+IHRpbWUuaW5jcmVhc2UoMTAwKTsgLy8gYW5vdGhlciAxMDAgc2Vjb25kcyBw
+YXNzCiAgICAKICAgICAgICBjb25zdCByZXdhcmRzID0gYXdhaXQgbmZ0U3Rh
+a2luZy5jYWxjdWxhdGVSZXdhcmRzKHN0YWtlcjEuYWRkcmVzcyk7CiAgICAg
+ICAgLy8gTkZUIDEgc3Rha2VkIGZvciAyMDBzLCBORlQgMiBzdGFrZWQgZm9y
+IDEwMHMKICAgICAgICBjb25zdCBleHBlY3RlZFJld2FyZHMgPSBSRVdBUkRT
+X1BFUl9TRUNPTkQubXVsKDIwMCkuYWRkKFJFV0FSRFNfUEVSX1NFQ09ORC5t
+dWwoMTAwKSk7CiAgICAKICAgICAgICBleHBlY3QocmV3YXJkcykudG8uYmUu
+Y2xvc2VUbyhleHBlY3RlZFJld2FyZHMsIGV0aGVycy51dGlscy5wYXJzZUV0
+aGVyKCIwLjAwMSIpKTsKICAgIH0pOwoKICAgIGl0KCJTaG91bGQgaGFuZGxl
+IG11bHRpcGxlIHN0YWtlcnMgY29ycmVjdGx5IiwgYXN5bmMgZnVuY3Rpb24g
+KCkgewogICAgICAgIGNvbnN0IHsgbmZ0U3Rha2luZywgbXlORlQsIHN0YWtl
+cjEsIHN0YWtlcjIgfSA9IGF3YWl0IGxvYWRGaXh0dXJlKGRlcGxveUNvbnRy
+YWN0c0ZpeHR1cmUpOwogICAgICAgIAogICAgICAgIC8vIFN0YWtlciAxIHN0
+YWtlcwogICAgICAgIGF3YWl0IG15TkZULmNvbm5lY3Qoc3Rha2VyMSkuYXBw
+cm92ZShuZnRTdGFraW5nLmFkZHJlc3MsIDEpOwogICAgICAgIGF3YWl0IG5m
+dFN0YWtpbmcuY29ubmVjdChzdGFrZXIxKS5zdGFrZShbMV0pOwogICAgICAg
+IAogICAgICAgIGF3YWl0IHRpbWUuaW5jcmVhc2UoNTApOwogICAgICAgIAog
+ICAgICAgIC8vIFN0YWtlciAyIHN0YWtlcwogICAgICAgIGF3YWl0IG15TkZU
+LmNvbm5lY3Qoc3Rha2VyMikuYXBwcm92ZShuZnRTdGFraW5nLmFkZHJlc3Ms
+IDMpOwogICAgICAgIGF3YWl0IG5mdFN0YWtpbmcuY29ubmVjdChzdGFrZXIy
+KS5zdGFrZShbM10pOwogICAgICAgIAogICAgICAgIGF3YWl0IHRpbWUuaW5j
+cmVhc2UoNTApOwogICAgICAgIAogICAgICAgIC8vIFN0YWtlciAxIGhhcyBz
+dGFrZWQgZm9yIDEwMCBzZWNvbmRzICg1MCArIDUwKQogICAgICAgIGNvbnN0
+IHJld2FyZHMxID0gYXdhaXQgbmZ0U3Rha2luZy5jYWxjdWxhdGVSZXdhcmRz
+KHN0YWtlcjEuYWRkcmVzcyk7CiAgICAgICAgY29uc3QgZXhwZWN0ZWRSZXdh
+cmRzMSA9IFJFV0FSRFNfUEVSX1NFQ09ORC5tdWwoMTAwKTsKICAgICAgICBl
+eHBlY3QocmV3YXJkczEpLnRvLmVxdWFsKGV4cGVjdGVkUmV3YXJkczEpOwog
+ICAgICAgIAogICAgICAgIC8vIFN0YWtlciAyIGhhcyBzdGFrZWQgZm9yIDUw
+IHNlY29uZHMKICAgICAgICBjb25zdCByZXdhcmRzMiA9IGF3YWl0IG5mdFN0
+YWtpbmcuY2FsY3VsYXRlUmV3YXJkcyhzdGFrZXIyLmFkZHJlc3MpOwogICAg
+ICAgIGNvbnN0IGV4cGVjdGVkUmV3YXJkczIgPSBSRVdBUkRTX1BFUl9TRUNP
+TkQubXVsKDUwKTsKICAgICAgICBleHBlY3QocmV3YXJkczIpLnRvLmVxdWFs
+KGV4cGVjdGVkUmV3YXJkczIpOwogICAgfSk7CiAgfSk7CgogIGRlc2NyaWJl
+KCJDbGFpbWluZyBhbmQgV2l0aGRyYXdpbmciLCBmdW5jdGlvbiAoKSB7CiAg
+ICBpdCgiU2hvdWxkIGFsbG93IGEgdXNlciB0byBjbGFpbSByZXdhcmRzIHdp
+dGhvdXQgd2l0aGRyYXdpbmciLCBhc3luYyBmdW5jdGlvbiAoKSB7CiAgICAg
+ICAgY29uc3QgeyBuZnRTdGFraW5nLCBteU5GVCwgcmV3YXJkc1Rva2VuLCBz
+dGFrZXIxIH0gPSBhd2FpdCBsb2FkRml4dHVyZShkZXBsb3lDb250cmFjdHNG
+aXh0dXJlKTsKICAgICAgICBjb25zdCB0b2tlbklkID0gMTsKICAgICAgICAK
+ICAgICAgICBhd2FpdCBteU5GVC5jb25uZWN0KHN0YWtlcjEpLmFwcHJvdmUo
+bmZ0U3Rha2luZy5hZGRyZXNzLCB0b2tlbklkKTsKICAgICAgICBhd2FpdCBu
+ZnRTdGFraW5nLmNvbm5lY3Qoc3Rha2VyMSkuc3Rha2UoW3Rva2VuSWRdKTsK
+ICAgICAgICAKICAgICAgICBjb25zdCBzdGFrZUR1cmF0aW9uID0gMTAwOwog
+ICAgICAgIGF3YWl0IHRpbWUuaW5jcmVhc2Uoc3Rha2VEdXJhdGlvbik7CiAg
+ICAgICAgCiAgICAgICAgY29uc3QgZXhwZWN0ZWRSZXdhcmRzID0gUkVXQVJE
+U19QRVJfU0VDT05ELm11bChzdGFrZUR1cmF0aW9uKTsKCiAgICAgICAgY29u
+c3QgY2xhaW1UeCA9IG5mdFN0YWtpbmcuY29ubmVjdChzdGFrZXIxKS5jbGFp
+bVJld2FyZHMoKTsKCiAgICAgICAgYXdhaXQgZXhwZWN0KGNsYWltVHgpLnRv
+LmNoYW5nZVRva2VuQmFsYW5jZXMoCiAgICAgICAgICAgIHJld2FyZHNUb2tl
+biwKICAgICAgICAgICAgW3N0YWtlcjEsIG5mdFN0YWtpbmddLAogICAgICAg
+ICAgICBbZXhwZWN0ZWRSZXdhcmRzLCBleHBlY3RlZFJld2FyZHMubXVsKC0x
+KV0KICAgICAgICApOwogICAgICAgIAogICAgICAgIC8vIFJld2FyZHMgc2hv
+dWxkIGJlIHJlc2V0IGFmdGVyIGNsYWltaW5nCiAgICAgICAgY29uc3QgcmV3
+YXJkc0FmdGVyQ2xhaW0gPSBhd2FpdCBuZnRTdGFraW5nLmNhbGN1bGF0ZVJl
+d2FyZHMoc3Rha2VyMS5hZGRyZXNzKTsKICAgICAgICBleHBlY3QocmV3YXJk
+c0FmdGVyQ2xhaW0pLnRvLmVxdWFsKDApOwogICAgICAgIAogICAgICAgIC8v
+IFN0YWtpbmcgaW5mbyB0aW1lc3RhbXAgc2hvdWxkIGJlIHVwZGF0ZWQKICAg
+ICAgICBjb25zdCBzdGFrZUluZm8gPSBhd2FpdCBuZnRTdGFraW5nLnN0YWtl
+ZFRva2Vucyh0b2tlbklkKTsKICAgICAgICBjb25zdCBsYXRlc3RCbG9jayA9
+IGF3YWl0IGV0aGVycy5wcm92aWRlci5nZXRCbG9jaygibGF0ZXN0Iik7CiAg
+ICAgICAgZXhwZWN0KHN0YWtlSW5mby50aW1lc3RhbXApLnRvLmVxdWFsKGxh
+dGVzdEJsb2NrLnRpbWVzdGFtcCk7CiAgICB9KTsKCiAgICBpdCgiU2hvdWxk
+IGFsbG93IGEgdXNlciB0byB3aXRoZHJhdyBhIHN0YWtlZCBORlQgYW5kIGNs
+YWltIHJld2FyZHMiLCBhc3luYyBmdW5jdGlvbiAoKSB7CiAgICAgICAgY29u
+c3QgeyBuZnRTdGFraW5nLCBteU5GVCwgcmV3YXJkc1Rva2VuLCBzdGFrZXIx
+IH0gPSBhd2FpdCBsb2FkRml4dHVyZShkZXBsb3lDb250cmFjdHNGaXh0dXJl
+KTsKICAgICAgICBjb25zdCB0b2tlbklkID0gMTsKICAgICAgICAKICAgICAg
+ICBhd2FpdCBteU5GVC5jb25uZWN0KHN0YWtlcjEpLmFwcHJvdmUobmZ0U3Rh
+a2luZy5hZGRyZXNzLCB0b2tlbklkKTsKICAgICAgICBhd2FpdCBuZnRTdGFr
+aW5nLmNvbm5lY3Qoc3Rha2VyMSkuc3Rha2UoW3Rva2VuSWRdKTsKICAgICAg
+ICAKICAgICAgICBjb25zdCBzdGFrZUR1cmF0aW9uID0gMjAwOwogICAgICAg
+IGF3YWl0IHRpbWUuaW5jcmVhc2Uoc3Rha2VEdXJhdGlvbik7CgogICAgICAg
+IGNvbnN0IGV4cGVjdGVkUmV3YXJkcyA9IFJFV0FSRFNfUEVSX1NFQ09ORC5t
+dWwoc3Rha2VEdXJhdGlvbik7CiAgICAgICAgCiAgICAgICAgY29uc3Qgd2l0
+aGRyYXdUeCA9IGF3YWl0IG5mdFN0YWtpbmcuY29ubmVjdChzdGFrZXIxKS53
+aXRoZHJhdyhbdG9rZW5JZF0pOwoKICAgICAgICAvLyBDaGVjayBORlQgaXMg
+cmV0dXJuZWQKICAgICAgICBleHBlY3QoYXdhaXQgbXlORlQub3duZXJPZih0
+b2tlbklkKSkudG8uZXF1YWwoc3Rha2VyMS5hZGRyZXNzKTsKCiAgICAgICAg
+Ly8gQ2hlY2sgcmV3YXJkcyBhcmUgcGFpZAogICAgICAgIGF3YWl0IGV4cGVj
+dCh3aXRoZHJhd1R4KS50by5jaGFuZ2VUb2tlbkJhbGFuY2VzKAogICAgICAg
+ICAgICByZXdhcmRzVG9rZW4sCiAgICAgICAgICAgIFtzdGFrZXIxLCBuZnRT
+dGFraW5nXSwKICAgICAgICAgICAgW2V4cGVjdGVkUmV3YXJkcywgZXhwZWN0
+ZWRSZXdhcmRzLm11bCgtMSldCiAgICAgICAgKTsKICAgICAgICAKICAgICAg
+ICAvLyBDaGVjayBzdGFraW5nIGluZm8gaXMgY2xlYXJlZAogICAgICAgIGNv
+bnN0IHN0YWtlckluZm8gPSBhd2FpdCBuZnRTdGFraW5nLmdldFN0YWtlcklu
+Zm8oc3Rha2VyMS5hZGRyZXNzKTsKICAgICAgICBleHBlY3Qoc3Rha2VySW5m
+by5hbW91bnRTdGFrZWQpLnRvLmVxdWFsKDApOwogICAgICAgIGNvbnN0IHN0
+YWtlSW5mbyA9IGF3YWl0IG5mdFN0YWtpbmcuc3Rha2VkVG9rZW5zKHRva2Vu
+SWQpOwogICAgICAgIGV4cGVjdChzdGFrZUluZm8uc3Rha2VyKS50by5lcXVh
+bChldGhlcnMuY29uc3RhbnRzLkFkZHJlc3NaZXJvKTsKCiAgICAgICAgYXdh
+aXQgZXhwZWN0KHdpdGhkcmF3VHgpCiAgICAgICAgICAgIC50by5lbWl0KG5m
+dFN0YWtpbmcsICJORlRXaXRoZHJhd24iKQogICAgICAgICAgICAud2l0aEFy
+Z3Moc3Rha2VyMS5hZGRyZXNzLCB0b2tlbklkKTsKICAgIH0pOwoKICAgIGl0
+KCJTaG91bGQgbm90IGFsbG93IGEgbm9uLXN0YWtlciB0byB3aXRoZHJhdyBh
+biBORlQiLCBhc3luYyBmdW5jdGlvbiAoKSB7CiAgICAgICAgY29uc3QgeyBu
+ZnRTdGFraW5nLCBteU5GVCwgc3Rha2VyMSwgc3Rha2VyMiB9ID0gYXdhaXQg
+bG9hZEZpeHR1cmUoZGVwbG95Q29udHJhY3RzRml4dHVyZSk7CiAgICAgICAg
+Y29uc3QgdG9rZW5JZCA9IDE7CgogICAgICAgIGF3YWl0IG15TkZULmNvbm5l
+Y3Qoc3Rha2VyMSkuYXBwcm92ZShuZnRTdGFraW5nLmFkZHJlc3MsIHRva2Vu
+SWQpOwogICAgICAgIGF3YWl0IG5mdFN0YWtpbmcuY29ubmVjdChzdGFrZXIx
+KS5zdGFrZShbdG9rZW5JZF0pOwogICAgICAgIAogICAgICAgIGF3YWl0IGV4
+cGVjdChuZnRTdGFraW5nLmNvbm5lY3Qoc3Rha2VyMikud2l0aGRyYXcoW3Rv
+a2VuSWRdKSkKICAgICAgICAgICAgLnRvLmJlLnJldmVydGVkV2l0aEN1c3Rv
+bUVycm9yKG5mdFN0YWtpbmcsICJORlRTdGFraW5nX19Ob3RTdGFrZXIiKTsK
+ICAgIH0pOwoKICAgIGl0KCJTaG91bGQgbm90IGFsbG93IHdpdGhkcmF3aW5n
+IGEgdG9rZW4gdGhhdCBpc24ndCBzdGFrZWQiLCBhc3luYyBmdW5jdGlvbiAo
+KSB7CiAgICAgICAgY29uc3QgeyBuZnRTdGFraW5nLCBzdGFrZXIxIH0gPSBh
+d2FpdCBsb2FkRml4dHVyZShkZXBsb3lDb250cmFjdHNGaXh0dXJlKTsKICAg
+ICAgICBjb25zdCB0b2tlbklkID0gOTk7IC8vIE5vdCBzdGFrZWQKICAgICAg
+ICAKICAgICAgICBhd2FpdCBleHBlY3QobmZ0U3Rha2luZy5jb25uZWN0KHN0
+YWtlcjEpLndpdGhkcmF3KFt0b2tlbklkXSkpCiAgICAgICAgICAgIC50by5i
+ZS5yZXZlcnRlZFdpdGhDdXN0b21FcnJvcihuZnRTdGFraW5nLCAiTkZUU3Rh
+a2luZ19fTm90U3Rha2VkIik7CiAgICB9KTsKICAgIAogICAgaXQoIlNob3Vs
+ZCBoYW5kbGUgd2l0aGRyYXdpbmcgbXVsdGlwbGUgTkZUcyIsIGFzeW5jIGZ1
+bmN0aW9uICgpIHsKICAgICAgICBjb25zdCB7IG5mdFN0YWtpbmcsIG15TkZU
+LCByZXdhcmRzVG9rZW4sIHN0YWtlcjEgfSA9IGF3YWl0IGxvYWRGaXh0dXJl
+KGRlcGxveUNvbnRyYWN0c0ZpeHR1cmUpOwogICAgICAgIGNvbnN0IHRva2Vu
+SWRzID0gWzEsIDJdOwogICAgICAgIAogICAgICAgIGF3YWl0IG15TkZULmNv
+bm5lY3Qoc3Rha2VyMSkuc2V0QXBwcm92YWxGb3JBbGwobmZ0U3Rha2luZy5h
+ZGRyZXNzLCB0cnVlKTsKICAgICAgICBhd2FpdCBuZnRTdGFraW5nLmNvbm5l
+Y3Qoc3Rha2VyMSkuc3Rha2UodG9rZW5JZHMpOwogICAgICAgIAogICAgICAg
+IGNvbnN0IHN0YWtlRHVyYXRpb24gPSAxNTA7CiAgICAgICAgYXdhaXQgdGlt
+ZS5pbmNyZWFzZShzdGFrZUR1cmF0aW9uKTsKCiAgICAgICAgY29uc3QgZXhw
+ZWN0ZWRSZXdhcmRzID0gUkVXQVJEU19QRVJfU0VDT05ELm11bChzdGFrZUR1
+cmF0aW9uKS5tdWwodG9rZW5JZHMubGVuZ3RoKTsKICAgICAgICAKICAgICAg
+ICBjb25zdCB3aXRoZHJhd1R4ID0gbmZ0U3Rha2luZy5jb25uZWN0KHN0YWtl
+cjEpLndpdGhkcmF3KHRva2VuSWRzKTsKCiAgICAgICAgLy8gQ2hlY2sgTkZU
+cyBhcmUgcmV0dXJuZWQKICAgICAgICBleHBlY3QoYXdhaXQgbXlORlQub3du
+ZXJPZih0b2tlbklkc1swXSkpLnRvLmVxdWFsKHN0YWtlcjEuYWRkcmVzcyk7
+CiAgICAgICAgZXhwZWN0KGF3YWl0IG15TkZULm93bmVyT2YodG9rZW5JZHNb
+MV0pKS50by5lcXVhbChzdGFrZXIxLmFkZHJlc3MpOwoKICAgICAgICAvLyBD
+aGVjayByZXdhcmRzIGFyZSBwYWlkCiAgICAgICAgYXdhaXQgZXhwZWN0KHdp
+dGhkcmF3VHgpLnRvLmNoYW5nZVRva2VuQmFsYW5jZXMoCiAgICAgICAgICAg
+IHJld2FyZHNUb2tlbiwKICAgICAgICAgICAgW3N0YWtlcjEsIG5mdFN0YWtp
+bmddLAogICAgICAgICAgICBbZXhwZWN0ZWRSZXdhcmRzLCBleHBlY3RlZFJl
+d2FyZHMubXVsKC0xKV0KICAgICAgICApOwogICAgICAgIAogICAgICAgIGNv
+bnN0IHN0YWtlckluZm8gPSBhd2FpdCBuZnRTdGFraW5nLmdldFN0YWtlcklu
+Zm8oc3Rha2VyMS5hZGRyZXNzKTsKICAgICAgICBleHBlY3Qoc3Rha2VySW5m
+by5hbW91bnRTdGFrZWQpLnRvLmVxdWFsKDApOwogICAgfSk7CgogICAgaXQo
+IlNob3VsZCByZWplY3Qgd2l0aGRyYXdpbmcgd2l0aCBhbiBlbXB0eSBhcnJh
+eSIsIGFzeW5jIGZ1bmN0aW9uICgpIHsKICAgICAgICBjb25zdCB7IG5mdFN0
+YWtpbmcsIHN0YWtlcjEgfSA9IGF3YWl0IGxvYWRGaXh0dXJlKGRlcGxveUNv
+bnRyYWN0c0ZpeHR1cmUpOwogICAgICAgIGF3YWl0IGV4cGVjdChuZnRTdGFr
+aW5nLmNvbm5lY3Qoc3Rha2VyMSkud2l0aGRyYXcoW10pKS50by5iZS5yZXZl
+cnRlZFdpdGhDdXN0b21FcnJvcigKICAgICAgICAgICAgbmZ0U3Rha2luZywK
+ICAgICAgICAgICAgIk5GVFN0YWtpbmdfX05vVG9rZW5zUHJvdmlkZWQiCiAg
+ICAgICAgKTsKICAgIH0pOwogIH0pOwoKICBkZXNjcmliZSgiRWRnZSBDYXNl
+cyBhbmQgU2VjdXJpdHkiLCBmdW5jdGlvbiAoKSB7CiAgICBpdCgiU2hvdWxk
+IHJldmVydCBpZiB0cnlpbmcgdG8gc2V0IHplcm8gYWRkcmVzcyBmb3IgTkZU
+IiwgYXN5bmMgZnVuY3Rpb24gKCkgewogICAgICAgIGNvbnN0IHsgbmZ0U3Rh
+a2luZywgcmV3YXJkc1Rva2VuIH0gPSBhd2FpdCBsb2FkRml4dHVyZShkZXBs
+b3lDb250cmFjdHNGaXh0dXJlKTsKICAgICAgICBjb25zdCBORlRTdGFraW5n
+RmFjdG9yeSA9IGF3YWl0IGV0aGVycy5nZXRDb250cmFjdEZhY3RvcnkoIk5G
+VFN0YWtpbmciKTsKICAgICAgICBhd2FpdCBleHBlY3QoTkZUU3Rha2luZ0Zh
+Y3RvcnkuZGVwbG95KAogICAgICAgICAgICBldGhlcnMuY29uc3RhbnRzLkFk
+ZHJlc3NaZXJvLAogICAgICAgICAgICByZXdhcmRzVG9rZW4uYWRkcmVzcwog
+ICAgICAgICkpLnRvLmJlLnJldmVydGVkV2l0aEN1c3RvbUVycm9yKG5mdFN0
+YWtpbmcsICJORlRTdGFraW5nX19aZXJvQWRkcmVzcyIpOwogICAgfSk7CiAg
+ICAKICAgIGl0KCJTaG91bGQgcmV2ZXJ0IGlmIHRyeWluZyB0byBzZXQgemVy
+byBhZGRyZXNzIGZvciByZXdhcmQgdG9rZW4iLCBhc3luYyBmdW5jdGlvbiAo
+KSB7CiAgICAgICAgY29uc3QgeyBuZnRTdGFraW5nLCBteU5GVCB9ID0gYXdh
+aXQgbG9hZEZpeHR1cmUoZGVwbG95Q29udHJhY3RzRml4dHVyZSk7CiAgICAg
+ICAgY29uc3QgTkZUU3Rha2luZ0ZhY3RvcnkgPSBhd2FpdCBldGhlcnMuZ2V0
+Q29udHJhY3RGYWN0b3J5KCJORlRTdGFraW5nIik7CiAgICAgICAgYXdhaXQg
+ZXhwZWN0KE5GVFN0YWtpbmdGYWN0b3J5LmRlcGxveSgKICAgICAgICAgICAg
+bXlORlQuYWRkcmVzcywKICAgICAgICAgICAgZXRoZXJzLmNvbnN0YW50cy5B
+ZGRyZXNzWmVybwogICAgICAgICkpLnRvLmJlLnJldmVydGVkV2l0aEN1c3Rv
+bUVycm9yKG5mdFN0YWtpbmcsICJORlRTdGFraW5nX19aZXJvQWRkcmVzcyIp
+OwogICAgfSk7CiAgICAKICAgIGl0KCJTaG91bGQgcmV2ZXJ0IGlmIG5vbi1v
+d25lciB0cmllcyB0byBjaGFuZ2UgcmV3YXJkcyBwZXIgc2Vjb25kIiwgYXN5
+bmMgZnVuY3Rpb24gKCkgewogICAgICAgIGNvbnN0IHsgbmZ0U3Rha2luZywg
+c3Rha2VyMSB9ID0gYXdhaXQgbG9hZEZpeHR1cmUoZGVwbG95Q29udHJhY3Rz
+Rml4dHVyZSk7CiAgICAgICAgY29uc3QgbmV3UmF0ZSA9IGV0aGVycy51dGls
+cy5wYXJzZUV0aGVyKCI1Iik7CiAgICAgICAgYXdhaXQgZXhwZWN0KG5mdFN0
+YWtpbmcuY29ubmVjdChzdGFrZXIxKS5zZXRSZXdhcmRzUGVyU2Vjb25kKG5l
+d1JhdGUpKQogICAgICAgICAgICAudG8uYmUucmV2ZXJ0ZWRXaXRoKCJPd25h
+YmxlOiBjYWxsZXIgaXMgbm90IHRoZSBvd25lciIpOwogICAgfSk7CgogICAg
+aXQoIlNob3VsZCBjb3JyZWN0bHkgdXBkYXRlIHJld2FyZHMgZm9yIGEgc3Rh
+a2VyIGFmdGVyIHRoZXkgY2xhaW0iLCBhc3luYyBmdW5jdGlvbiAoKSB7CiAg
+ICAgICAgY29uc3QgeyBuZnRTdGFraW5nLCBteU5GVCwgc3Rha2VyMSB9ID0g
+YXdhaXQgbG9hZEZpeHR1cmUoZGVwbG95Q29udHJhY3RzRml4dHVyZSk7CiAg
+ICAgICAgY29uc3QgdG9rZW5JZCA9IDE7CiAgICAgICAgCiAgICAgICAgYXdh
+aXQgbXlORlQuY29ubmVjdChzdGFrZXIxKS5zZXRBcHByb3ZhbEZvckFsbChu
+ZnRTdGFraW5nLmFkZHJlc3MsIHRydWUpOwogICAgICAgIGF3YWl0IG5mdFN0
+YWtpbmcuY29ubmVjdChzdGFrZXIxKS5zdGFrZShbdG9rZW5JZF0pOwogICAg
+ICAgIAogICAgICAgIGF3YWl0IHRpbWUuaW5jcmVhc2UoMTAwKTsKICAgICAg
+ICBhd2FpdCBuZnRTdGFraW5nLmNvbm5lY3Qoc3Rha2VyMSkuY2xhaW1SZXdh
+cmRzKCk7IC8vIENsYWltIGFmdGVyIDEwMHMKICAgICAgICAKICAgICAgICBh
+d2FpdCB0aW1lLmluY3JlYXNlKDUwKTsgLy8gV2FpdCBhbm90aGVyIDUwcwog
+ICAgICAgIAogICAgICAgIGNvbnN0IHJld2FyZHMgPSBhd2FpdCBuZnRTdGFr
+aW5nLmNhbGN1bGF0ZVJld2FyZHMoc3Rha2VyMS5hZGRyZXNzKTsKICAgICAg
+ICBjb25zdCBleHBlY3RlZFJld2FyZHMgPSBSRVdBUkRTX1BFUl9TRUNPTkQu
+bXVsKDUwKTsgLy8gU2hvdWxkIG9ubHkgYmUgZm9yIHRoZSBsYXN0IDUwcwog
+ICAgICAgIAogICAgICAgIGV4cGVjdChyZXdhcmRzKS50by5iZS5jbG9zZVRv
+KGV4cGVjdGVkUmV3YXJkcywgZXRoZXJzLnV0aWxzLnBhcnNlRXRoZXIoIjAu
+MDAxIikpOwogICAgfSk7CiAgICAKICAgIGl0KCJTaG91bGQgcmV2ZXJ0IHJl
+d2FyZCB0cmFuc2ZlciBpZiBjb250cmFjdCBoYXMgaW5zdWZmaWNpZW50IGJh
+bGFuY2UiLCBhc3luYyBmdW5jdGlvbigpIHsKICAgICAgICBjb25zdCB7IG5m
+dFN0YWtpbmcsIG15TkZULCByZXdhcmRzVG9rZW4sIG93bmVyLCBzdGFrZXIx
+IH0gPSBhd2FpdCBsb2FkRml4dHVyZShkZXBsb3lDb250cmFjdHNGaXh0dXJl
+KTsKICAgICAgICAKICAgICAgICAvLyBEcmFpbiB0aGUgc3Rha2luZyBjb250
+cmFjdCBvZiBpdHMgcmV3YXJkIHRva2VucwogICAgICAgIGNvbnN0IGJhbGFu
+Y2UgPSBhd2FpdCByZXdhcmRzVG9rZW4uYmFsYW5jZU9mKG5mdFN0YWtpbmcu
+YWRkcmVzcyk7CiAgICAgICAgYXdhaXQgbmZ0U3Rha2luZy5jb25uZWN0KG93
+bmVyKS5lbWVyZ2VuY3lSZXdhcmRXaXRoZHJhdyhiYWxhbmNlKTsKICAgICAg
+ICAKICAgICAgICAvLyBTdGFrZXIgMSBzdGFrZXMKICAgICAgICBhd2FpdCBt
+eU5GVC5jb25uZWN0KHN0YWtlcjEpLnNldEFwcHJvdmFsRm9yQWxsKG5mdFN0
+YWtpbmcuYWRkcmVzcywgdHJ1ZSk7CiAgICAgICAgYXdhaXQgbmZ0U3Rha2lu
+Zy5jb25uZWN0KHN0YWtlcjEpLnN0YWtlKFsxXSk7CiAgICAgICAgCiAgICAg
+ICAgYXdhaXQgdGltZS5pbmNyZWFzZSgxMDApOwogICAgICAgIAogICAgICAg
+IC8vIFN0YWtlciAxIHRyaWVzIHRvIGNsYWltIHJld2FyZHMKICAgICAgICBh
+d2FpdCBleHBlY3QobmZ0U3Rha2luZy5jb25uZWN0KHN0YWtlcjEpLmNsYWlt
+UmV3YXJkcygpKQogICAgICAgICAgICAudG8uYmUucmV2ZXJ0ZWRXaXRoKCJF
+UkMyMDogdHJhbnNmZXIgYW1vdW50IGV4Y2VlZHMgYmFsYW5jZSIpOwogICAg
+fSk7CiAgfSk7Cn0pOwo=
