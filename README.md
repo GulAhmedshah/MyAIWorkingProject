@@ -1,14 +1,3 @@
-// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.19;
-
-/**
- * @title Project README
- * @author NFT Staking Platform Team
- * @notice This file contains the project's README documentation.
- * Due to system constraints, the markdown content is embedded within this Solidity file's comment block.
- * To view this with proper formatting, copy the content from line 12 to a file named README.md.
- *
- * ------------------------------------------------------------------------------------------------------
 
 # NFT Staking Platform
 
